@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>com.iboob.app</string>
+    <key>CFBundleName</key><string>iboob</string>
+    <key>CFBundleShortVersionString</key><string>2.0</string>
+    <key>CFBundleVersion</key><string>2</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSAccessibilityUsageDescription</key><string>iboob requires accessibility to read selected text.</string>
+    <key>NSAppleEventsUsageDescription</key><string>iboob uses System Events to send keystrokes.</string>
+    <key>NSScreenCaptureUsageDescription</key><string>iboob captures screen regions for OCR.</string>
+</dict>
+</plist>
