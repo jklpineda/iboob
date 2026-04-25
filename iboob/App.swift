@@ -23,12 +23,14 @@ import SwiftUI
         wireHotkeys()
         
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self else { return }
             let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             let isSelfBundle = app?.bundleIdentifier == Bundle.main.bundleIdentifier
 
             Task { @MainActor [weak self] in
-                guard let self, !isSelfBundle, self.bar.isVisible else { return }
-                self.dismiss()
+                guard let self else { return }
+                await self.sel.clear() 
+                if !isSelfBundle && self.bar.isVisible { self.dismiss() }
             }
         }
     }
@@ -49,7 +51,13 @@ import SwiftUI
             for await s in sel.stream {
                 guard !Task.isCancelled else { break }
                 if await sel.isIgnored(s.text) { continue }
-                cachedText = s.text; ownerPID = s.ownerPID; show(s.text, s.rect)
+                
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.cachedText = s.text
+                    self.ownerPID = s.ownerPID
+                    self.show(s.text, s.rect)
+                }
             }
         }
     }
@@ -113,11 +121,9 @@ import SwiftUI
         if !trusted {
             status.button?.image = NSImage(systemSymbolName: "exclamationmark.lock.fill", accessibilityDescription: nil)
         } else {
-            // Intenta cargar tu icono personalizado "StatusBarIcon" desde Assets
             if let customIcon = NSImage(named: "StatusBarIcon") {
                 status.button?.image = customIcon
             } else {
-                // Fallback a SFSymbol si no existe el asset
                 status.button?.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
             }
         }
