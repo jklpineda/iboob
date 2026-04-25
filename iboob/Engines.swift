@@ -17,7 +17,6 @@ struct PopAction: Identifiable, Sendable {
     enum Kind: Sendable { case search, copy, capture, ai(Character) }
     let kind: Kind
 
-    // Se han actualizado los colores para usar .accentColor donde sea apropiado
     static let all: [PopAction] = [
         .init(label: "Search", symbol: "safari", tint: .accentColor, kind: .search),
         .init(label: "Copy", symbol: "doc.on.doc.fill", tint: .green, kind: .copy),
@@ -67,36 +66,123 @@ actor SelectionEngine {
     private let continuation: AsyncStream<Selection>.Continuation
     
     private var lastText = ""
+    private var lastPID: pid_t = 0
     private var lastEvID = -1
     private var evID = 0
     private var ignored = false
     private var running = false
+    private var motorBusy = false 
+    private var hasInteractionSinceFocus = false 
+    private var cooldownUntil: Date? = nil
+    private var requireManualInteraction = false
+    private var hardLockUntilManual = false
+    
     private var pending: Task<Void, Never>?
     private var monitors: [AnyObject] = []
-    
     private var mouseDownPos: CGPoint = .zero
+    private var awaitingDragSelection = false
+    private var lastManualInteractionAt: Date? = nil
 
     private init() { (stream, continuation) = AsyncStream.makeStream(of: Selection.self, bufferingPolicy: .bufferingNewest(4)) }
 
     func start() { guard !running else { return }; running = true; Task { await installMonitors() } }
     func stop() { running = false; pending?.cancel(); Task { await removeMonitors() } }
 
-    func bump() { evID &+= 1; ignored = false }
-    func dismiss() { ignored = true }
-    func consumeSelection() { ignored = true }
-    func isIgnored(_ text: String) -> Bool { ignored && text == lastText }
+    func setBusy(_ busy: Bool) { motorBusy = busy }
+    func checkIsBusy() -> Bool { motorBusy }
+    
+    func bump(at pos: CGPoint) {
+        evID &+= 1
+        // Enter strict lock on mouse down; only a drag will unlock.
+        pending?.cancel()
+        ignored = true
+        motorBusy = false
+        mouseDownPos = pos
+        hasInteractionSinceFocus = true
+        requireManualInteraction = true
+        hardLockUntilManual = true
+        cooldownUntil = nil
+        lastManualInteractionAt = Date()
+        awaitingDragSelection = true
+    }
+
+    func unlockAfterMouseUp() {
+        // Only unlock if there was a real drag (new manual selection)
+        let current = NSEvent.mouseLocation
+        let dx = current.x - mouseDownPos.x
+        let dy = current.y - mouseDownPos.y
+        let dist = sqrt(dx*dx + dy*dy)
+        // Threshold ~4px to avoid clicks being treated as selections
+        if awaitingDragSelection && dist > 4.0 {
+            ignored = false
+            requireManualInteraction = false
+            hardLockUntilManual = false
+            hasInteractionSinceFocus = true
+            lastManualInteractionAt = Date()
+        }
+        awaitingDragSelection = false
+    }
+    
+    func dismiss() { ignored = true; motorBusy = false; requireManualInteraction = true; hasInteractionSinceFocus = false }
+
+    func consumeSelection() {
+        // After applying any action, require explicit manual interaction and hard-lock.
+        pending?.cancel()
+        ignored = true
+        motorBusy = true
+        requireManualInteraction = true
+        hardLockUntilManual = true
+        hasInteractionSinceFocus = false
+        lastText = ""
+        // Longer grace period to let the host app mutate selection/content.
+        let cooldown = Date().addingTimeInterval(1.8)
+        cooldownUntil = cooldown
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1800))
+            await self?.endBusy()
+            // Keep hard lock until a real mouse bump clears it.
+        }
+    }
+    
+    private func endBusy() { motorBusy = false }
+
+    func clear() {
+        lastText = ""
+        lastPID = 0
+        ignored = false
+        motorBusy = false
+        hasInteractionSinceFocus = false
+        requireManualInteraction = false
+        cooldownUntil = nil
+        lastManualInteractionAt = nil
+        hardLockUntilManual = false
+        pending?.cancel()
+    }
+
+    func isIgnored(_ text: String) -> Bool { (ignored && text == lastText) || motorBusy || requireManualInteraction || hardLockUntilManual || (cooldownUntil != nil && (cooldownUntil! > Date())) }
 
     func schedule() {
+        guard !motorBusy, hasInteractionSinceFocus, !requireManualInteraction, !hardLockUntilManual, !awaitingDragSelection, (cooldownUntil == nil || cooldownUntil! <= Date()) else { return }
         pending?.cancel()
         pending = Task {
-            try? await Task.sleep(for: .milliseconds(60))
-            guard !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled, !motorBusy, hasInteractionSinceFocus, !requireManualInteraction, !hardLockUntilManual, !awaitingDragSelection, (cooldownUntil == nil || cooldownUntil! <= Date()) else { return }
             await attemptRead()
         }
     }
 
     @discardableResult private func attemptRead() async -> Bool {
-        guard AXIsProcessTrusted() else { return false }
+        guard AXIsProcessTrusted(), !motorBusy, hasInteractionSinceFocus, !requireManualInteraction, !hardLockUntilManual, !awaitingDragSelection, (cooldownUntil == nil || cooldownUntil! <= Date()) else { return false }
+        
+        let mousePos = await MainActor.run { NSEvent.mouseLocation }
+        let visibleArea = await MainActor.run { () -> CGRect in
+            let screens = NSScreen.screens
+            let s = screens.first(where: { $0.frame.contains(mousePos) }) ?? NSScreen.main
+            return s?.visibleFrame ?? .zero
+        }
+        
+        // Anti-Bip: No procesar en Dock o Menú
+        guard visibleArea.contains(mousePos) else { return false }
         
         let buttonsDown = await MainActor.run { NSEvent.pressedMouseButtons != 0 }
         guard !buttonsDown else { return false }
@@ -104,49 +190,104 @@ actor SelectionEngine {
         guard let frontApp = await MainActor.run(body: { NSWorkspace.shared.frontmostApplication }),
               frontApp.bundleIdentifier != Bundle.main.bundleIdentifier else { return false }
         
+        // Apple Notes specific: require recent manual interaction; block automatic reselections
+        if frontApp.bundleIdentifier == "com.apple.Notes" {
+            // Must have a bump within the last 3 seconds
+            if requireManualInteraction { return false }
+            if let t = lastManualInteractionAt, Date().timeIntervalSince(t) > 3.0 { return false }
+        }
+        
         let pid = frontApp.processIdentifier
         let app = AXUIElementCreateApplication(pid)
+        
+        var windowRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowRef) == .success else { return false }
+        
         let focused = axElement(app, kAXFocusedUIElementAttribute) ?? app
         
         var text: String?
         var textRef: CFTypeRef?
+        
+        // 1. Intento nativo (Safari, Notas, Xcode)
         if AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &textRef) == .success,
            let val = textRef as? String, !val.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             text = val
         }
         
+        // 2. Modo Forzado (Optimizado para Pages y Electron)
         if text == nil {
-            let currentPos = await MainActor.run { NSEvent.mouseLocation }
-            let dist = sqrt(pow(currentPos.x - mouseDownPos.x, 2) + pow(currentPos.y - mouseDownPos.y, 2))
-            if dist > 4 {
-                text = await readByForcingCopy(pid: pid)
+            let dist = sqrt(pow(mousePos.x - mouseDownPos.x, 2) + pow(mousePos.y - mouseDownPos.y, 2))
+            let isPages = frontApp.bundleIdentifier == "com.apple.iWork.Pages"
+            let isNotes = frontApp.bundleIdentifier == "com.apple.Notes"
+            
+            // En Notes, no forzar copy para evitar selecciones/efectos colaterales.
+            if !isNotes {
+                // Si es Pages, umbral bajo (10px). Otros umbral medio (30px) y filtro de roles estructurales
+                if (isPages && dist > 10) || (dist > 30 && !isStructuralElement(focused)) {
+                    text = await readByForcingCopy(pid: pid)
+                }
             }
         }
 
-        guard let finalText = text?.trimmingCharacters(in: .whitespacesAndNewlines), 
-              !finalText.isEmpty, 
-              !shouldSuppress(text: finalText) else { return false }
+        guard let rawText = text?.trimmingCharacters(in: .whitespacesAndNewlines), 
+              !rawText.isEmpty,
+              rawText.rangeOfCharacter(from: .alphanumerics) != nil,
+              !shouldSuppress(text: rawText, pid: pid) else { return false }
 
+        // POSICIONAMIENTO INTELIGENTE:
+        // Pages/Electron suelen dar rectángulos erróneos. Si el rect es gigante o nulo, usamos el mouse.
         var rect = await MainActor.run { CGRect(origin: NSEvent.mouseLocation, size: .zero) }
         if let r = selectionRect(for: focused) {
-            let d = sqrt(pow(r.midX - rect.minX, 2) + pow(r.midY - rect.minY, 2))
-            if r.height <= 250 && d <= 250 { rect = r }
+            let d = sqrt(pow(r.midX - mousePos.x, 2) + pow(r.midY - mousePos.y, 2))
+            if r.height > 1 && r.height < 600 && r.width < 1200 && d < 600 {
+                rect = r
+            }
         }
 
-        lastText = finalText; lastEvID = evID; ignored = false
-        continuation.yield(Selection(text: finalText, rect: rect, ownerPID: pid))
+        lastText = rawText; lastPID = pid; lastEvID = evID; ignored = false
+        // Final safety: do not yield if manual interaction is still required or cooldown active.
+        if requireManualInteraction || hardLockUntilManual || (cooldownUntil != nil && cooldownUntil! > Date()) { return false }
+        // Extra safety for Apple Notes: only yield if interaction is recent
+        if let front = await MainActor.run(body: { NSWorkspace.shared.frontmostApplication }), front.bundleIdentifier == "com.apple.Notes" {
+            if let t = lastManualInteractionAt, Date().timeIntervalSince(t) > 3.0 { return false }
+        }
+        continuation.yield(Selection(text: rawText, rect: rect, ownerPID: pid))
         return true
     }
 
-    private func shouldSuppress(text: String) -> Bool { text == lastText && (ignored || lastEvID == evID) }
+    /// Filtra elementos de UI que NO son texto para evitar Bips de error
+    private func isStructuralElement(_ el: AXUIElement) -> Bool {
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleRef) == .success,
+              let role = roleRef as? String else { return true }
+        
+        let structural: [String] = [
+            kAXButtonRole as String, kAXScrollBarRole as String, kAXMenuBarRole as String,
+            kAXMenuRole as String, kAXMenuItemRole as String, kAXPopUpButtonRole as String,
+            kAXRadioButtonRole as String, kAXCheckBoxRole as String, kAXTableRole as String,
+            kAXRowRole as String, kAXCellRole as String, kAXListRole as String,
+            kAXOutlineRole as String, kAXTabGroupRole as String, kAXToolbarRole as String,
+            kAXApplicationRole as String, kAXWindowRole as String, kAXImageRole as String,
+            kAXSplitterRole as String, "AXDockItem"
+        ]
+        return structural.contains(role)
+    }
+
+    private func shouldSuppress(text: String, pid: pid_t) -> Bool { 
+        if motorBusy || !hasInteractionSinceFocus { return true }
+        return text == lastText && pid == lastPID && (ignored || lastEvID == evID) 
+    }
 
     private func readByForcingCopy(pid: pid_t) async -> String? {
+        guard let front = await MainActor.run(body: { NSWorkspace.shared.frontmostApplication }), 
+              front.processIdentifier == pid, !front.isHidden else { return nil }
+        
         let pb = NSPasteboard.general
         let oldChangeCount = pb.changeCount
         
         let savedItems = pb.pasteboardItems?.compactMap { item -> NSPasteboardItem? in
             let new = NSPasteboardItem()
-            for type in item.types { if let data = item.data(forType: type) { new.setData(data, forType: type) } }
+            for t in item.types { if let data = item.data(forType: t) { new.setData(data, forType: t) } }
             return new
         } ?? []
 
@@ -155,12 +296,11 @@ actor SelectionEngine {
         let cUp = CGEvent(keyboardEventSource: src, virtualKey: 0x08, keyDown: false)
         cDown?.flags = .maskCommand; cUp?.flags = .maskCommand
         
-        cDown?.postToPid(pid)
-        cUp?.postToPid(pid)
+        cDown?.postToPid(pid); cUp?.postToPid(pid)
 
         var resultText: String?
-        for _ in 0..<10 {
-            try? await Task.sleep(for: .milliseconds(20))
+        for _ in 0..<12 {
+            try? await Task.sleep(for: .milliseconds(40))
             if pb.changeCount != oldChangeCount {
                 resultText = pb.string(forType: .string)
                 break
@@ -171,7 +311,6 @@ actor SelectionEngine {
             pb.clearContents()
             if !savedItems.isEmpty { pb.writeObjects(savedItems) }
         }
-
         return resultText
     }
 
@@ -192,25 +331,35 @@ actor SelectionEngine {
         return CGRect(x: r.minX, y: s.frame.maxY - r.maxY, width: r.width, height: r.height)
     }
 
-    private func axElement(_ el: AXUIElement, _ attr: String) -> AXUIElement? { var r: CFTypeRef?; return AXUIElementCopyAttributeValue(el, attr as CFString, &r) == .success && CFGetTypeID(r!) == AXUIElementGetTypeID() ? unsafeBitCast(r!, to: AXUIElement.self) : nil }
+    private func axElement(_ el: AXUIElement, _ attr: String) -> AXUIElement? { 
+        var r: CFTypeRef?
+        return AXUIElementCopyAttributeValue(el, attr as CFString, &r) == .success && CFGetTypeID(r!) == AXUIElementGetTypeID() ? unsafeBitCast(r!, to: AXUIElement.self) : nil 
+    }
 
     private func installMonitors() async {
         monitors = [
-            NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] e in
+            NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { _ in
                 let pos = NSEvent.mouseLocation
-                Task { await self?.setMouseDownPos(pos); await self?.bump() }
+                Task { await SelectionEngine.shared.bump(at: pos) }
             },
-            NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in
-                Task { await self?.schedule() }
+            NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { _ in
+                Task {
+                    await SelectionEngine.shared.unlockAfterMouseUp()
+                    await SelectionEngine.shared.schedule()
+                }
             },
-            NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { [weak self] e in
+            NSEvent.addGlobalMonitorForEvents(matching: .keyUp) { e in
                 let m = e.modifierFlags
-                if m.contains(.shift) || m.contains(.command) { Task { await self?.schedule() } }
+                if m.contains(.shift) || m.contains(.command) {
+                    Task {
+                        let busy = await SelectionEngine.shared.checkIsBusy()
+                        if !busy { await SelectionEngine.shared.schedule() }
+                    }
+                }
             }
         ].compactMap { $0 as AnyObject }
     }
     
-    private func setMouseDownPos(_ pos: CGPoint) { self.mouseDownPos = pos }
     private func removeMonitors() async { monitors.forEach { NSEvent.removeMonitor($0) }; monitors.removeAll() }
 }
 
@@ -221,12 +370,15 @@ actor SelectionEngine {
     private init() {}
 
     func execute(_ action: PopAction, text: String, ownerPID pid: pid_t) async {
+        await SelectionEngine.shared.setBusy(true)
+        
         switch action.kind {
         case .search: if let q = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed), let u = URL(string: "https://www.google.com/search?q=\(q)") { NSWorkspace.shared.open(u) }
         case .copy: HUD.shared.show(paste(text) ? "Copied ✓" : "Error")
         case .capture: if let t = await OCRCapture.shared.capture(), !t.isEmpty, paste(t) { HUD.shared.show("Captured ✓") }
         case .ai(let k): await sendAIHotkey(key: k, pid: pid)
         }
+        
         await SelectionEngine.shared.consumeSelection()
     }
 
@@ -234,7 +386,7 @@ actor SelectionEngine {
 
     private func sendAIHotkey(key: Character, pid: pid_t) async {
         if let app = NSWorkspace.shared.runningApplications.first(where: { $0.processIdentifier == pid }) { app.activate(options: .activateAllWindows) }
-        try? await Task.sleep(for: .milliseconds(100))
+        try? await Task.sleep(for: .milliseconds(150))
         guard let c = codes[key] else { return }
         let script = "tell application \"System Events\" to key code \(c.0) using {control down, option down, command down}"
         DispatchQueue.global().async { NSAppleScript(source: script)?.executeAndReturnError(nil) }
@@ -298,3 +450,4 @@ enum LoginItems {
         set { if #available(macOS 13, *) { try? newValue ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() } }
     }
 }
+
